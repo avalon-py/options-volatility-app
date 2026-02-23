@@ -4,5 +4,5 @@ pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.11.0
 plotly>=5.22.0
-requests>=2.31.0
+curl_cffi>=0.7.0
 firebase-admin>=6.5.0
