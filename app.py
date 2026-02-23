@@ -115,12 +115,50 @@ def build_surface(r_input: float, moneyness_range: tuple) -> dict:
         )
     })
 
-    tk = yf.Ticker("^SPX")
-    hist = tk.history(period="1d")
-    if hist.empty:
-        raise RuntimeError("Could not retrieve SPX spot price from Yahoo Finance.")
+    S = None
 
-    S = float(hist["Close"].iloc[-1])
+    # Attempt 1: fast_info — lightest call, least likely to be throttled
+    try:
+        _tk = yf.Ticker("^GSPC")
+        S = float(_tk.fast_info["last_price"])
+    except Exception:
+        pass
+
+    # Attempt 2: history on ^GSPC (same index, more permissive ticker)
+    if not S:
+        try:
+            hist = yf.Ticker("^GSPC").history(period="2d")
+            if not hist.empty:
+                S = float(hist["Close"].iloc[-1])
+        except Exception:
+            pass
+
+    # Attempt 3: history on ^SPX
+    if not S:
+        try:
+            hist = yf.Ticker("^SPX").history(period="2d")
+            if not hist.empty:
+                S = float(hist["Close"].iloc[-1])
+        except Exception:
+            pass
+
+    # Attempt 4: yf.download — uses a completely different internal code path
+    if not S:
+        try:
+            hist = yf.download("^GSPC", period="2d", progress=False, auto_adjust=True)
+            if not hist.empty:
+                S = float(hist["Close"].iloc[-1])
+        except Exception:
+            pass
+
+    if not S:
+        raise RuntimeError(
+            "Could not retrieve SPX spot price after 4 attempts. "
+            "Yahoo Finance may be throttling — wait a few minutes and try again."
+        )
+
+    # ^GSPC is the same underlying as ^SPX and returns option chains reliably
+    tk = yf.Ticker("^GSPC")
     exps = tk.options[:10]
 
     progress = st.progress(0, text="Fetching option chains…")
