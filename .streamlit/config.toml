@@ -1,3 +1,11 @@
 [server]
 enableCORS = false
 enableXsrfProtection = false
+headless = true
+# This forces Streamlit to use a standard port that's rarely blocked
+port = 8501 
+
+[browser]
+# This tells the browser exactly where to look
+serverAddress = "localhost"
+gatherUsageStats = false
