@@ -37,35 +37,46 @@ find_iv_vec = np.vectorize(find_iv)
 # --- 3. DATA INGESTION (With Cooldowns) ---
 @st.cache_data(ttl=3600)
 def get_market_data(ticker_symbol):
-    tk = yf.Ticker(ticker_symbol, session=session)
+    # We stop passing a manual session and let yfinance 
+    # use its internal curl_cffi implementation
+    tk = yf.Ticker(ticker_symbol)
     
-    # Get current price
+    # 1. Get current price
     hist = tk.history(period='1d')
-    if hist.empty: return None, None
+    if hist.empty: 
+        return None, None
     S = hist['Close'].iloc[-1]
     
-    # Reduced to 10 expirations to stay under Yahoo's radar
-    exps = tk.options[:10]
+    # 2. Get Expirations
+    exps = tk.options[:10] # Stick to 10 for safety
     all_options = []
     
+    # 3. Progress tracking for the user
     progress_bar = st.progress(0)
+    status_text = st.empty()
+
     for i, date in enumerate(exps):
         try:
+            status_text.text(f"Fetching contracts for {date}...")
             opt = tk.option_chain(date)
             calls = opt.calls
             calls['expirationDate'] = date
             all_options.append(calls)
-            # Add a small delay to prevent rapid-fire requests
-            time.sleep(0.3) 
+            
+            # MANDATORY COOLDOWN: Yahoo is sensitive!
+            time.sleep(0.5) 
             progress_bar.progress((i + 1) / len(exps))
         except Exception as e:
-            st.warning(f"Could not fetch data for {date}: {e}")
+            st.warning(f"Skipping {date} due to API throttle: {e}")
             continue
-    
-    if not all_options: return None, None
+            
+    if not all_options: 
+        return None, None
+        
     df = pd.concat(all_options).reset_index(drop=True)
+    status_text.text("Baking complete!")
     return df, S
-
+    
 # --- 4. MAIN UI ---
 st.title("📈 Hardened ^SPX Volatility Surface")
 
@@ -114,3 +125,4 @@ try:
 except Exception as e:
     st.error(f"An error occurred: {e}")
     st.info("Try refreshing the page or checking the sidebar to clear the cache.")
+
