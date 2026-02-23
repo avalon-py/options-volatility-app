@@ -10,6 +10,10 @@ Flow:
 
 Frontend rendering is done entirely client-side via Plotly.js so the
 heavy numpy interpolation only runs once per calendar day globally.
+
+Yahoo rate-limiting fix: curl_cffi impersonates Chrome at the TLS
+fingerprint level — this is the only reliable bypass on shared cloud IPs.
+A plain requests.Session() with a custom User-Agent is not sufficient.
 """
 
 import json
@@ -18,10 +22,10 @@ from datetime import datetime, date
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
+from curl_cffi import requests as curl_requests
 from scipy.interpolate import griddata
 from scipy.optimize import brentq
 from scipy.stats import norm
@@ -43,13 +47,6 @@ FIRESTORE_COLLECTION = "vol_surfaces"
 # ── FIREBASE INIT (singleton) ─────────────────────────────────────────────────
 @st.cache_resource
 def init_firebase():
-    """
-    Initialise the Firebase Admin SDK exactly once per server process.
-
-    Credentials are read from st.secrets["firebase"] which maps to the
-    [firebase] section of .streamlit/secrets.toml.  See secrets.toml.template
-    in this repo for the required keys.
-    """
     if firebase_admin._apps:
         return firestore.client()
 
@@ -72,25 +69,23 @@ def init_firebase():
 
 # ── FIRESTORE HELPERS ─────────────────────────────────────────────────────────
 def firestore_read(db, date_key: str) -> dict | None:
-    """Return today's surface dict from Firestore, or None if absent."""
     doc = db.collection(FIRESTORE_COLLECTION).document(date_key).get()
     return doc.to_dict() if doc.exists else None
 
 
 def firestore_write(db, date_key: str, payload: dict) -> None:
-    """Persist the surface payload to Firestore under today's date key."""
     db.collection(FIRESTORE_COLLECTION).document(date_key).set(payload)
 
 
 # ── BLACK-SCHOLES / IV ENGINE ─────────────────────────────────────────────────
-def bs_call_price(S: float, K, T, r: float, sigma) -> np.ndarray:
+def bs_call_price(S, K, T, r, sigma):
     with np.errstate(divide="ignore", invalid="ignore"):
         d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
         d2 = d1 - sigma * np.sqrt(T)
         return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
 
 
-def _find_iv_scalar(price: float, S: float, K: float, T: float, r: float) -> float:
+def _find_iv_scalar(price, S, K, T, r):
     try:
         return brentq(lambda s: bs_call_price(S, K, T, r, s) - price, 1e-6, 5.0)
     except Exception:
@@ -105,47 +100,26 @@ def build_surface(r_input: float, moneyness_range: tuple) -> dict:
     """
     Pull live option chain data from Yahoo Finance, compute the IV surface,
     and return a JSON-serialisable dict ready for Firestore + Plotly.
+
+    Uses curl_cffi to impersonate Chrome at the TLS fingerprint level,
+    which is the only reliable way to avoid Yahoo's rate limiter on
+    shared cloud IPs like Streamlit Community Cloud.
     """
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    })
+    # impersonate="chrome" spoofs the full TLS handshake, not just the
+    # User-Agent header. yfinance accepts any requests-compatible session.
+    curl_session = curl_requests.Session(impersonate="chrome")
+    tk = yf.Ticker("^GSPC", session=curl_session)
 
+    # Get spot price
     S = None
-
-    # Attempt 1: fast_info — lightest call, least likely to be throttled
     try:
-        _tk = yf.Ticker("^GSPC")
-        S = float(_tk.fast_info["last_price"])
+        S = float(tk.fast_info["last_price"])
     except Exception:
         pass
 
-    # Attempt 2: history on ^GSPC (same index, more permissive ticker)
     if not S:
         try:
-            hist = yf.Ticker("^GSPC").history(period="2d")
-            if not hist.empty:
-                S = float(hist["Close"].iloc[-1])
-        except Exception:
-            pass
-
-    # Attempt 3: history on ^SPX
-    if not S:
-        try:
-            hist = yf.Ticker("^SPX").history(period="2d")
-            if not hist.empty:
-                S = float(hist["Close"].iloc[-1])
-        except Exception:
-            pass
-
-    # Attempt 4: yf.download — uses a completely different internal code path
-    if not S:
-        try:
-            hist = yf.download("^GSPC", period="2d", progress=False, auto_adjust=True)
+            hist = tk.history(period="2d")
             if not hist.empty:
                 S = float(hist["Close"].iloc[-1])
         except Exception:
@@ -153,12 +127,10 @@ def build_surface(r_input: float, moneyness_range: tuple) -> dict:
 
     if not S:
         raise RuntimeError(
-            "Could not retrieve SPX spot price after 4 attempts. "
-            "Yahoo Finance may be throttling — wait a few minutes and try again."
+            "Could not retrieve SPX spot price. "
+            "Yahoo Finance may still be warming up — wait a moment and retry."
         )
 
-    # ^GSPC is the same underlying as ^SPX and returns option chains reliably
-    tk = yf.Ticker("^GSPC")
     exps = tk.options[:10]
 
     progress = st.progress(0, text="Fetching option chains…")
@@ -172,7 +144,7 @@ def build_surface(r_input: float, moneyness_range: tuple) -> dict:
             calls = chain.calls.copy()
             calls["expirationDate"] = exp_date
             all_calls.append(calls)
-            time.sleep(0.5)          # respectful throttle
+            time.sleep(0.4)
         except Exception as exc:
             st.warning(f"Skipping {exp_date}: {exc}")
         progress.progress((i + 1) / len(exps))
@@ -187,7 +159,7 @@ def build_surface(r_input: float, moneyness_range: tuple) -> dict:
     df["expirationDate"] = pd.to_datetime(df["expirationDate"])
     df["T"] = (df["expirationDate"] - datetime.now()).dt.days / 365.0
 
-    # ── Quality filters ──
+    # Quality filters
     df = df[(df["bid"] > 0) & (df["volume"] > 0)]
     df["mid_price"] = (df["bid"] + df["ask"]) / 2
     df["moneyness"] = df["strike"] / S
@@ -197,14 +169,14 @@ def build_surface(r_input: float, moneyness_range: tuple) -> dict:
         & (df["T"] > 2 / 365.0)
     ]
 
-    # ── Implied Volatility ──
+    # Implied Volatility
     df["iv"] = find_iv_vec(df["mid_price"], S, df["strike"], df["T"], r_input)
     df = df.dropna(subset=["iv"])
 
     if df.empty:
         raise RuntimeError("IV computation yielded no valid points after filtering.")
 
-    # ── Interpolation grid (50×50) ──
+    # Interpolation grid (50x50)
     grid_x, grid_y = np.mgrid[
         df["strike"].min(): df["strike"].max(): 50j,
         df["T"].min(): df["T"].max(): 50j,
@@ -216,7 +188,6 @@ def build_surface(r_input: float, moneyness_range: tuple) -> dict:
         method="cubic",
     )
 
-    # Replace NaN with None so JSON is happy
     grid_z_clean = np.where(np.isnan(grid_z), None, grid_z)
 
     return {
@@ -234,15 +205,14 @@ def build_surface(r_input: float, moneyness_range: tuple) -> dict:
 
 # ── PLOTLY.JS RENDERER ────────────────────────────────────────────────────────
 def render_plotly_js(payload: dict) -> None:
-    """
-    Embed a self-contained Plotly.js surface plot inside a Streamlit HTML
-    component.  All rendering happens in the browser — no server-side Plotly.
-    """
     S = payload["S"]
     ts = payload.get("timestamp", "")[:10]
-    source_label = "🔄 Live (just computed)" if payload.get("source") == "yahoo_finance" else f"⚡ Cached from Firestore ({ts})"
+    source_label = (
+        "🔄 Live (just computed)"
+        if payload.get("source") == "yahoo_finance"
+        else f"⚡ Cached from Firestore ({ts})"
+    )
 
-    # Serialise only what JS needs — keep the blob small
     js_payload = json.dumps({
         "x": payload["grid_x"],
         "y": payload["grid_y"],
@@ -333,10 +303,6 @@ def render_plotly_js(payload: dict) -> None:
   const raw = {js_payload};
   const S   = raw.S;
 
-  // Build readable x-axis labels (strike → moneyness %)
-  const x0 = raw.x.map(row => row[0]);          // first-column strikes per row
-  const y0 = raw.x[0].map((_, ci) => raw.y[0][ci]); // T values
-
   const surface = {{
     type: 'surface',
     x: raw.x,
@@ -374,7 +340,7 @@ def render_plotly_js(payload: dict) -> None:
 
   const layout = {{
     paper_bgcolor: '#0a0e1a',
-    plot_bgcolor: '#0a0e1a',
+    plot_bgcolor:  '#0a0e1a',
     margin: {{ l: 0, r: 0, t: 0, b: 0 }},
     scene: {{
       bgcolor: '#0a0e1a',
@@ -410,7 +376,6 @@ def render_plotly_js(payload: dict) -> None:
 
   Plotly.newPlot('plot', [surface], layout, config);
 
-  // Live tooltip enrichment
   document.getElementById('plot').on('plotly_hover', function(data) {{
     const pt = data.points[0];
     if (!pt) return;
@@ -456,17 +421,14 @@ try:
     db = init_firebase()
     today_key = date.today().isoformat()
 
-    # ── 1. Try Firestore first ──────────────────────────────────────────────
     with st.spinner("Checking Firestore for today's surface…"):
         cached = firestore_read(db, today_key)
 
     if cached:
-        # ── Cache HIT: render immediately, no Yahoo call needed ──
         st.toast(f"⚡ Loaded from Firestore (computed at {cached.get('timestamp','?')[:16]} UTC)", icon="✅")
         render_plotly_js(cached)
 
     else:
-        # ── Cache MISS: compute, persist, then render ──
         st.info(
             "🔄  No cached surface for today — fetching live data from Yahoo Finance.  "
             "This takes ~30 seconds and only happens once per day."
